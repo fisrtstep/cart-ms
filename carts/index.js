@@ -1,9 +1,11 @@
 import express from 'express';
+import { randomUUID } from 'node:crypto';
 import { requireAuth } from '../middleware/requireAuth.js';
 import { getUser } from '../lib/iamClient.js';
 import { getProduct, reserveStock } from '../lib/catalogClient.js';
 import { createInvoice } from '../lib/invoicesClient.js';
 import { getItems, addItem, removeItem, clear } from './repository.js';
+import { publish } from '../lib/events.js';
 
 const cartsRouter = express.Router();
 cartsRouter.use(requireAuth);
@@ -75,8 +77,16 @@ cartsRouter.delete('/me/items/:productId', async (req, res, next) => {
 
 // POST /carts/me/checkout -> { invoiceId, total }
 // Reserves stock for every line, then issues the invoice and empties the cart.
-// TODO: release already-reserved stock when a later line fails (needs a release endpoint in catalog-ms).
+// Publishes `cart.checked_out` on success. If anything fails after a reservation,
+// publishes `checkout.failed` with the reserved lines so catalog-ms puts the stock back.
 cartsRouter.post('/me/checkout', async (req, res, next) => {
+    const reserved = [];
+    const fail = (reason) =>
+        reserved.length === 0
+            ? Promise.resolve()
+            : publish('checkout.failed', { userId: req.userId, reason, reserved }).catch((err) =>
+                  console.error('could not publish checkout.failed', err),
+              );
     try {
         const rows = await getItems(req.userId);
         if (rows.length === 0) return res.status(400).json({ error: 'Cart is empty' });
@@ -84,23 +94,37 @@ cartsRouter.post('/me/checkout', async (req, res, next) => {
         for (const row of rows) {
             const result = await reserveStock(row.product_id, row.quantity);
             if (!result.ok) {
+                await fail('OUT_OF_STOCK');
                 return res.status(409).json({ error: 'OUT_OF_STOCK', productId: row.product_id });
             }
+            reserved.push({ productId: row.product_id, quantity: row.quantity });
         }
 
+        const lines = rows.map((r) => ({
+            productId: r.product_id,
+            sku: r.sku,
+            description: r.name,
+            quantity: r.quantity,
+            unitPrice: r.unit_price_cents / 100,
+        }));
         const invoice = await createInvoice({
             userId: req.userId,
             currency: rows[0].currency,
-            lines: rows.map((r) => ({
-                sku: r.sku,
-                description: r.name,
-                quantity: r.quantity,
-                unitPrice: r.unit_price_cents / 100,
-            })),
+            lines: lines.map(({ productId: _productId, ...line }) => line),
+        });
+        reserved.length = 0;
+        await publish('cart.checked_out', {
+            checkoutId: randomUUID(),
+            userId: req.userId,
+            invoiceId: invoice.id,
+            total: invoice.total,
+            currency: rows[0].currency,
+            lines,
         });
         await clear(req.userId);
         res.status(201).json({ invoiceId: invoice.id, total: invoice.total });
     } catch (err) {
+        await fail('ERROR');
         next(err);
     }
 });

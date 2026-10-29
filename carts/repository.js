@@ -29,3 +29,11 @@ export async function removeItem(userId, productId) {
 export async function clear(userId) {
     await pool.query('DELETE FROM cart_items WHERE user_id = $1', [userId]);
 }
+
+// Refreshes the product snapshot held in every cart that contains it.
+export async function refreshProduct({ productId, name, unitPriceCents, currency }) {
+    await pool.query(
+        'UPDATE cart_items SET name = $2, unit_price_cents = $3, currency = $4 WHERE product_id = $1',
+        [productId, name, unitPriceCents, currency],
+    );
+}
